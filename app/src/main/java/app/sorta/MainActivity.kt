@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -36,7 +37,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.SelectAll
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -100,12 +104,20 @@ class VM(app: Application) : AndroidViewModel(app) {
     var left by mutableStateOf(act("left", Act.DELETE)); private set
     var right by mutableStateOf(act("right", Act.NAS)); private set
     var dbl by mutableStateOf(act("double", Act.SHARE)); private set
+    var deleteAfterNas by mutableStateOf(prefs.getBoolean("delAfterNas", false)); private set
+    var silentDelete by mutableStateOf(prefs.getBoolean("silentDelete", false)); private set
+    var columns by mutableStateOf(prefs.getInt("columns", 3)); private set
     val nas = mutableStateMapOf<String, String>().apply { listOf("url", "user", "pass", "dir").forEach { put(it, prefs.getString(it, "") ?: "") } }
 
     fun setAct(k: String, a: Act) {
         prefs.edit().putString(k, a.name).apply()
         when (k) { "left" -> left = a; "right" -> right = a; else -> dbl = a }
     }
+    fun setBool(k: String, v: Boolean) {
+        prefs.edit().putBoolean(k, v).apply()
+        when (k) { "delAfterNas" -> deleteAfterNas = v; "silentDelete" -> silentDelete = v }
+    }
+    fun setColumns(n: Int) { columns = n; prefs.edit().putInt("columns", n).apply() }
     fun setNas(k: String, v: String) { nas[k] = v; prefs.edit().putString(k, v).apply() }
 
     fun load() = viewModelScope.launch(Dispatchers.IO) {
@@ -136,6 +148,11 @@ class VM(app: Application) : AndroidViewModel(app) {
                 .header("Authorization", Credentials.basic(nas["user"].orEmpty(), nas["pass"].orEmpty())).build()
             client.newCall(req).execute().use { require(it.isSuccessful) { "NAS replied ${it.code}" } }
         }
+    }
+
+    /** Deletes directly with no system dialog. Only succeeds where the OS allows silent delete. */
+    suspend fun deleteDirect(uris: List<Uri>): Int = withContext(Dispatchers.IO) {
+        uris.count { runCatching { cr.delete(it, null, null) > 0 }.getOrDefault(false) }
     }
 }
 
@@ -168,173 +185,75 @@ fun Sorta(vm: VM = viewModel()) {
     var granted by remember { mutableStateOf(hasPerm(ctx)) }
     var settings by remember { mutableStateOf(false) }
     var preview by remember { mutableStateOf<Uri?>(null) }
+    var selectionMode by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(setOf<Uri>()) }
     val permLauncher = rememberLauncherForActivityResult(RequestMultiplePermissions()) { granted = hasPerm(ctx); if (granted) vm.load() }
     val deleter = rememberLauncherForActivityResult(StartIntentSenderForResult()) { if (it.resultCode == android.app.Activity.RESULT_OK) vm.load() }
     LaunchedEffect(Unit) { if (granted) vm.load() else permLauncher.launch(PERMS) }
 
-    fun perform(a: Act, m: Media) {
-        when (a) {
+    fun requestDelete(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        if (vm.silentDelete && Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
+            scope.launch {
+                val ok = vm.deleteDirect(uris)
+                vm.load()
+                snack.showSnackbar(if (ok == uris.size) "Deleted" else "Deleted $ok of ${uris.size}")
+            }
+        } else {
+            runCatching {
+                deleter.launch(IntentSenderRequest.Builder(MediaStore.createDeleteRequest(ctx.contentResolver, uris).intentSender).build())
+            }
+        }
+    }
+
+    fun performBatch(a: Act, targets: List<Media>) {
+        if (targets.isNotEmpty()) when (a) {
             Act.NONE -> {}
             Act.SHARE -> runCatching {
-                ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType(m.mime)
-                    .putExtra(Intent.EXTRA_STREAM, m.uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), null))
+                val intent = if (targets.size == 1) {
+                    Intent(Intent.ACTION_SEND).setType(targets[0].mime).putExtra(Intent.EXTRA_STREAM, targets[0].uri)
+                } else {
+                    Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*")
+                        .putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(targets.map { it.uri }))
+                }
+                ctx.startActivity(Intent.createChooser(intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), null))
             }
-            Act.DELETE -> deleter.launch(IntentSenderRequest.Builder(MediaStore.createDeleteRequest(ctx.contentResolver, listOf(m.uri)).intentSender).build())
+            Act.DELETE -> requestDelete(targets.map { it.uri })
             Act.NAS -> {
-                scope.launch { snack.showSnackbar("Sending ${m.name}…", duration = SnackbarDuration.Indefinite) }
+                val snapshot = targets
                 scope.launch {
-                    val r = vm.upload(m)
+                    val label = if (snapshot.size == 1) snapshot[0].name else "${snapshot.size} items"
+                    scope.launch { snack.showSnackbar("Sending $label…", duration = SnackbarDuration.Indefinite) }
+                    var ok = 0
+                    val sent = mutableListOf<Uri>()
+                    for (m in snapshot) {
+                        val r = vm.upload(m)
+                        if (r.isSuccess) { ok++; sent += m.uri }
+                    }
                     snack.currentSnackbarData?.dismiss()
-                    snack.showSnackbar(if (r.isSuccess) "Sent to NAS ✓" else r.exceptionOrNull()?.message ?: "Upload failed")
+                    snack.showSnackbar(if (ok == snapshot.size) "Sent $ok to NAS ✓" else "Sent $ok of ${snapshot.size} to NAS")
+                    if (vm.deleteAfterNas && sent.isNotEmpty()) requestDelete(sent)
                 }
             }
         }
+        selectionMode = false
+        selected = emptySet()
     }
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
             topBar = {
-                TopAppBar(title = { Text("Sorta", fontWeight = FontWeight.Bold) },
-                    actions = { IconButton({ settings = true }) { Icon(Icons.Rounded.Settings, "Settings") } })
-            },
-            snackbarHost = { SnackbarHost(snack) },
-        ) { pad ->
-            if (!granted) Box(Modifier.fillMaxSize().padding(pad), Alignment.Center) {
-                Button({ permLauncher.launch(PERMS) }) { Text("Allow access to photos & videos") }
-            } else LazyVerticalGrid(
-                GridCells.Adaptive(110.dp), Modifier.padding(pad).fillMaxSize(),
-                contentPadding = PaddingValues(3.dp),
-                horizontalArrangement = Arrangement.spacedBy(3.dp), verticalArrangement = Arrangement.spacedBy(3.dp),
-            ) {
-                items(vm.items, key = { it.uri.toString() }) { m ->
-                    Tile(m, preview == m.uri, vm,
-                        onPreview = { on -> preview = if (on) m.uri else if (preview == m.uri) null else preview },
-                        onAct = { perform(it, m) })
-                }
-            }
-        }
-        AnimatedVisibility(settings, enter = slideInVertically { it }, exit = slideOutVertically { it }) {
-            BackHandler { settings = false }
-            SettingsScreen(vm) { settings = false }
-        }
-    }
-}
-
-@Composable
-fun Tile(m: Media, playing: Boolean, vm: VM, onPreview: (Boolean) -> Unit, onAct: (Act) -> Unit) {
-    val ctx = LocalContext.current
-    val haptic = LocalHapticFeedback.current
-    val scope = rememberCoroutineScope()
-    val off = remember { Animatable(0f) }
-    val thresh = with(LocalDensity.current) { 100.dp.toPx() }
-    val pending = if (off.value > thresh) vm.right else if (off.value < -thresh) vm.left else Act.NONE
-
-    Box(
-        Modifier.aspectRatio(1f).zIndex(if (off.value != 0f) 1f else 0f)
-            .graphicsLayer { translationX = off.value * .6f }
-            .clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .pointerInput(Unit) {
-                detectHorizontalDragGestures(
-                    onDragEnd = {
-                        val a = if (off.value > thresh) vm.right else if (off.value < -thresh) vm.left else Act.NONE
-                        if (a != Act.NONE) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onAct(a) }
-                        scope.launch { off.animateTo(0f, spring(dampingRatio = .7f)) }
-                    },
-                    onDragCancel = { scope.launch { off.animateTo(0f) } },
-                ) { change, d -> change.consume(); scope.launch { off.snapTo(off.value + d) } }
-            }
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = {
-                        runCatching {
-                            ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(m.uri, m.mime)
-                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                TopAppBar(
+                    title = { Text(if (selectionMode) "${selected.size} selected" else "Sorta", fontWeight = FontWeight.Bold) },
+                    navigationIcon = {
+                        if (selectionMode) IconButton({ selectionMode = false; selected = emptySet() }) {
+                            Icon(Icons.Rounded.Close, "Cancel selection")
                         }
                     },
-                    onDoubleTap = { onAct(vm.dbl) },
-                    onLongPress = { if (m.video) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onPreview(true) } },
+                    actions = {
+                        if (!selectionMode) {
+                            IconButton({ selectionMode = true }) { Icon(Icons.Rounded.SelectAll, "Select") }
+                            IconButton({ settings = true }) { Icon(Icons.Rounded.Settings, "Settings") }
+                        }
+                    },
                 )
-            }
-    ) {
-        AsyncImage(m.uri, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-        if (playing) Preview(m.uri) { onPreview(false) }
-        if (m.video && !playing) Icon(Icons.Rounded.PlayArrow, null, tint = Color.White,
-            modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
-                .background(Color.Black.copy(.45f), CircleShape).size(20.dp))
-        if (pending != Act.NONE) Text(pending.label, color = Color.White, style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.align(Alignment.Center).background(Color.Black.copy(.65f), CircleShape)
-                .padding(horizontal = 10.dp, vertical = 4.dp))
-    }
-}
-
-/** Muted, 5-second in-tile preview; calls done() when finished. */
-@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-@Composable
-fun Preview(uri: Uri, done: () -> Unit) {
-    val ctx = LocalContext.current
-    val player = remember {
-        ExoPlayer.Builder(ctx).build().apply {
-            volume = 0f
-            setMediaItem(MediaItem.Builder().setUri(uri)
-                .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder().setEndPositionMs(5000).build()).build())
-            prepare(); playWhenReady = true
-        }
-    }
-    DisposableEffect(player) {
-        val l = object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) { if (state == Player.STATE_ENDED) done() }
-        }
-        player.addListener(l)
-        onDispose { player.removeListener(l); player.release(); done() }
-    }
-    AndroidView(factory = {
-        PlayerView(it).apply {
-            this.player = player; useController = false
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-            setShutterBackgroundColor(0)
-        }
-    }, modifier = Modifier.fillMaxSize())
-}
-
-@Composable
-fun SettingsScreen(vm: VM, close: () -> Unit) {
-    Scaffold(topBar = {
-        TopAppBar(title = { Text("Settings") },
-            navigationIcon = { IconButton(close) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
-    }) { pad ->
-        Column(Modifier.padding(pad).padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text("Gestures", style = MaterialTheme.typography.titleMedium)
-            Picker("Swipe left", vm.left) { vm.setAct("left", it) }
-            Picker("Swipe right", vm.right) { vm.setAct("right", it) }
-            Picker("Double tap", vm.dbl) { vm.setAct("double", it) }
-            Text("Single tap opens the photo or video. Long-press a video for a 5-second preview.",
-                style = MaterialTheme.typography.bodySmall)
-            HorizontalDivider()
-            Text("Ugreen NAS (WebDAV)", style = MaterialTheme.typography.titleMedium)
-            Field(vm, "url", "Address (e.g. http://192.168.1.20:5005)")
-            Field(vm, "dir", "Folder (e.g. Photos/Sorta)")
-            Field(vm, "user", "Username")
-            Field(vm, "pass", "Password", password = true)
-        }
-    }
-}
-
-@Composable
-fun Field(vm: VM, key: String, label: String, password: Boolean = false) {
-    OutlinedTextField(vm.nas[key].orEmpty(), { vm.setNas(key, it) }, Modifier.fillMaxWidth(), singleLine = true,
-        label = { Text(label) },
-        visualTransformation = if (password) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None)
-}
-
-@Composable
-fun Picker(label: String, value: Act, set: (Act) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    ExposedDropdownMenuBox(open, { open = it }) {
-        OutlinedTextField(value.label, {}, Modifier.menuAnchor().fillMaxWidth(), readOnly = true,
-            label = { Text(label) }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(open) })
-        ExposedDropdownMenu(open, { open = false }) {
-            Act.entries.forEach { a -> DropdownMenuItem({ Text(a.label) }, { set(a); open = false }) }
-        }
-    }
-}
