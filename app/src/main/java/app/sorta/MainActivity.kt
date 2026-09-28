@@ -240,20 +240,244 @@ fun Sorta(vm: VM = viewModel()) {
         selected = emptySet()
     }
 
+    val titleText = if (selectionMode) "${selected.size} selected" else "Sorta"
+
     Box(Modifier.fillMaxSize()) {
         Scaffold(
             topBar = {
                 TopAppBar(
-                    title = { Text(if (selectionMode) "${selected.size} selected" else "Sorta", fontWeight = FontWeight.Bold) },
+                    title = { Text(titleText, fontWeight = FontWeight.Bold) },
                     navigationIcon = {
-                        if (selectionMode) IconButton({ selectionMode = false; selected = emptySet() }) {
-                            Icon(Icons.Rounded.Close, "Cancel selection")
+                        if (selectionMode) {
+                            IconButton(onClick = { selectionMode = false; selected = emptySet() }) {
+                                Icon(Icons.Rounded.Close, contentDescription = "Cancel selection")
+                            }
                         }
                     },
                     actions = {
                         if (!selectionMode) {
-                            IconButton({ selectionMode = true }) { Icon(Icons.Rounded.SelectAll, "Select") }
-                            IconButton({ settings = true }) { Icon(Icons.Rounded.Settings, "Settings") }
+                            IconButton(onClick = { selectionMode = true }) {
+                                Icon(Icons.Rounded.SelectAll, contentDescription = "Select")
+                            }
+                            IconButton(onClick = { settings = true }) {
+                                Icon(Icons.Rounded.Settings, contentDescription = "Settings")
+                            }
                         }
                     },
                 )
+            },
+            snackbarHost = { SnackbarHost(snack) },
+        ) { pad ->
+            if (!granted) Box(Modifier.fillMaxSize().padding(pad), Alignment.Center) {
+                Button({ permLauncher.launch(PERMS) }) { Text("Allow access to photos & videos") }
+            } else LazyVerticalGrid(
+                GridCells.Fixed(vm.columns), Modifier.padding(pad).fillMaxSize(),
+                contentPadding = PaddingValues(3.dp),
+                horizontalArrangement = Arrangement.spacedBy(3.dp), verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                items(vm.items, key = { it.uri.toString() }) { m ->
+                    Tile(
+                        m = m,
+                        playing = preview == m.uri,
+                        selectionMode = selectionMode,
+                        isSelected = m.uri in selected,
+                        vm = vm,
+                        onPreview = { on -> preview = if (on) m.uri else if (preview == m.uri) null else preview },
+                        onToggleSelect = { selected = if (m.uri in selected) selected - m.uri else selected + m.uri },
+                        onAct = { act ->
+                            val targets = if (selectionMode && selected.isNotEmpty()) vm.items.filter { it.uri in selected } else listOf(m)
+                            performBatch(act, targets)
+                        },
+                    )
+                }
+            }
+        }
+        AnimatedVisibility(settings, enter = slideInVertically { it }, exit = slideOutVertically { it }) {
+            BackHandler { settings = false }
+            SettingsScreen(vm) { settings = false }
+        }
+    }
+}
+
+@Composable
+fun Tile(
+    m: Media,
+    playing: Boolean,
+    selectionMode: Boolean,
+    isSelected: Boolean,
+    vm: VM,
+    onPreview: (Boolean) -> Unit,
+    onToggleSelect: () -> Unit,
+    onAct: (Act) -> Unit,
+) {
+    val ctx = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
+    val off = remember { Animatable(0f) }
+    val thresh = with(LocalDensity.current) { 100.dp.toPx() }
+    val pending = if (off.value > thresh) vm.right else if (off.value < -thresh) vm.left else Act.NONE
+
+    Box(
+        Modifier.aspectRatio(1f).zIndex(if (off.value != 0f) 1f else 0f)
+            .graphicsLayer { translationX = off.value * .6f }
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .pointerInput(Unit) {
+                detectHorizontalDragGestures(
+                    onDragEnd = {
+                        val a = if (off.value > thresh) vm.right else if (off.value < -thresh) vm.left else Act.NONE
+                        if (a != Act.NONE) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onAct(a) }
+                        scope.launch { off.animateTo(0f, spring(dampingRatio = .7f)) }
+                    },
+                    onDragCancel = { scope.launch { off.animateTo(0f) } },
+                ) { change, d -> change.consume(); scope.launch { off.snapTo(off.value + d) } }
+            }
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = {
+                        if (selectionMode) onToggleSelect()
+                        else runCatching {
+                            ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(m.uri, m.mime)
+                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                        }
+                    },
+                    onDoubleTap = { onAct(vm.dbl) },
+                    onLongPress = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        if (selectionMode) onToggleSelect()
+                        else if (m.video) onPreview(true)
+                    },
+                )
+            }
+    ) {
+        AsyncImage(m.uri, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        if (playing) Preview(m.uri) { onPreview(false) }
+        if (m.video && !playing) Icon(Icons.Rounded.PlayArrow, null, tint = Color.White,
+            modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
+                .background(Color.Black.copy(.45f), CircleShape).size(20.dp))
+        if (pending != Act.NONE) Text(pending.label, color = Color.White, style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.align(Alignment.Center).background(Color.Black.copy(.65f), CircleShape)
+                .padding(horizontal = 10.dp, vertical = 4.dp))
+        if (selectionMode) Box(
+            Modifier.align(Alignment.TopEnd).padding(6.dp).size(22.dp).clip(CircleShape)
+                .background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Black.copy(.35f)),
+            contentAlignment = Alignment.Center,
+        ) { if (isSelected) Icon(Icons.Rounded.Check, null, tint = Color.White, modifier = Modifier.size(14.dp)) }
+    }
+}
+
+/** Muted, 5-second in-tile preview; calls done() when finished. */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+fun Preview(uri: Uri, done: () -> Unit) {
+    val ctx = LocalContext.current
+    val player = remember {
+        ExoPlayer.Builder(ctx).build().apply {
+            volume = 0f
+            setMediaItem(MediaItem.Builder().setUri(uri)
+                .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder().setEndPositionMs(5000).build()).build())
+            prepare(); playWhenReady = true
+        }
+    }
+    DisposableEffect(player) {
+        val l = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) { if (state == Player.STATE_ENDED) done() }
+        }
+        player.addListener(l)
+        onDispose { player.removeListener(l); player.release(); done() }
+    }
+    AndroidView(factory = {
+        PlayerView(it).apply {
+            this.player = player; useController = false
+            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            setShutterBackgroundColor(0)
+        }
+    }, modifier = Modifier.fillMaxSize())
+}
+
+@Composable
+fun SettingsScreen(vm: VM, close: () -> Unit) {
+    val ctx = LocalContext.current
+    Scaffold(topBar = {
+        TopAppBar(title = { Text("Settings") },
+            navigationIcon = { IconButton(close) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } })
+    }) { pad ->
+        Column(Modifier.padding(pad).padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Text("Gestures", style = MaterialTheme.typography.titleMedium)
+            Picker("Swipe left", vm.left) { vm.setAct("left", it) }
+            Picker("Swipe right", vm.right) { vm.setAct("right", it) }
+            Picker("Double tap", vm.dbl) { vm.setAct("double", it) }
+            Text("Single tap opens the photo or video. Long-press a video for a 5-second preview. Tap the select icon in the top bar to choose several tiles, then swipe or double-tap any of the whole selection.",
+                style = MaterialTheme.typography.bodySmall)
+            HorizontalDivider()
+            Text("Layout", style = MaterialTheme.typography.titleMedium)
+            ColumnsPicker(vm.columns) { vm.setColumns(it) }
+            Text("Fewer columns give each tile more room to swipe before your finger reaches the edge of the screen.",
+                style = MaterialTheme.typography.bodySmall)
+            HorizontalDivider()
+            Text("Deleting", style = MaterialTheme.typography.titleMedium)
+            SwitchRow("Delete from phone after sending to NAS", vm.deleteAfterNas) { vm.setBool("delAfterNas", it) }
+            SwitchRow("Delete without confirmation", vm.silentDelete) { checked ->
+                vm.setBool("silentDelete", checked)
+                if (checked && Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                    runCatching {
+                        ctx.startActivity(Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:${ctx.packageName}")))
+                    }
+                }
+            }
+            if (vm.silentDelete) Text(
+                "Grant \"All files access\" when prompted, or in system Settings, or deletes will fall back to asking each time. A quick status still shows at the bottom after every delete.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            HorizontalDivider()
+            Text("Ugreen NAS (WebDAV)", style = MaterialTheme.typography.titleMedium)
+            Field(vm, "url", "Address (e.g. http://192.168.1.20:5005)")
+            Field(vm, "dir", "Folder (e.g. Photos/Sorta)")
+            Field(vm, "user", "Username")
+            Field(vm, "pass", "Password", password = true)
+        }
+    }
+}
+
+@Composable
+fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f).padding(end = 12.dp))
+        Switch(checked, onChange)
+    }
+}
+
+@Composable
+fun Field(vm: VM, key: String, label: String, password: Boolean = false) {
+    OutlinedTextField(vm.nas[key].orEmpty(), { vm.setNas(key, it) }, Modifier.fillMaxWidth(), singleLine = true,
+        label = { Text(label) },
+        visualTransformation = if (password) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None)
+}
+
+@Composable
+fun Picker(label: String, value: Act, set: (Act) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(open, { open = it }) {
+        OutlinedTextField(value.label, {}, Modifier.menuAnchor().fillMaxWidth(), readOnly = true,
+            label = { Text(label) }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(open) })
+        ExposedDropdownMenu(open, { open = false }) {
+            Act.entries.forEach { a -> DropdownMenuItem({ Text(a.label) }, { set(a); open = false }) }
+        }
+    }
+}
+
+@Composable
+fun ColumnsPicker(value: Int, set: (Int) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val label = if (value == 1) "1 column" else "$value columns"
+    ExposedDropdownMenuBox(open, { open = it }) {
+        OutlinedTextField(label, {}, Modifier.menuAnchor().fillMaxWidth(), readOnly = true,
+            label = { Text("Grid columns") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(open) })
+        ExposedDropdownMenu(open, { open = false }) {
+            listOf(1, 2, 3).forEach { n ->
+                DropdownMenuItem({ Text(if (n == 1) "1 column" else "$n columns") }, { set(n); open = false })
+            }
+        }
+    }
+}
