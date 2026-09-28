@@ -117,7 +117,7 @@ class VM(app: Application) : AndroidViewModel(app) {
         prefs.edit().putBoolean(k, v).apply()
         when (k) { "delAfterNas" -> deleteAfterNas = v; "silentDelete" -> silentDelete = v }
     }
-    fun setColumns(n: Int) { columns = n; prefs.edit().putInt("columns", n).apply() }
+    fun changeColumns(n: Int) { columns = n; prefs.edit().putInt("columns", n).apply() }
     fun setNas(k: String, v: String) { nas[k] = v; prefs.edit().putString(k, v).apply() }
 
     fun load() = viewModelScope.launch(Dispatchers.IO) {
