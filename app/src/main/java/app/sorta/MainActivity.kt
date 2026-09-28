@@ -411,7 +411,7 @@ fun SettingsScreen(vm: VM, close: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall)
             HorizontalDivider()
             Text("Layout", style = MaterialTheme.typography.titleMedium)
-            ColumnsPicker(vm.columns) { vm.setColumns(it) }
+            ColumnsPicker(vm.columns) { vm.changeColumns(it) }
             Text("Fewer columns give each tile more room to swipe before your finger reaches the edge of the screen.",
                 style = MaterialTheme.typography.bodySmall)
             HorizontalDivider()
